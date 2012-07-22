@@ -9,6 +9,11 @@ input devices including:
 * G15
 * G19
 
+Experimental :-
+
+* G15v2
+* G510 
+
 Personally I don't know too much about any of the devices except the G110 (because I have one).
 
 This work has been mostly done by a couple of friendly people on the Freenode IRC channel #lg4l

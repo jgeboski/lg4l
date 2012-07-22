@@ -28,12 +28,12 @@
 #include <linux/vmalloc.h>
 #include <linux/leds.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
 
 #include "hid-ids.h"
 #include "usbhid/usbhid.h"
 
-#include "hid-gfb.h"
-
+#include "hid-gcommon.h"
 #define GFB_NAME "Logitech GamePanel Framebuffer"
 
 /* Framebuffer defines */
@@ -41,14 +41,14 @@
 #define GFB_UPDATE_RATE_DEFAULT (30)
 
 /* Convenience macros */
-#define hid_get_gfbdata(hdev) \
-	((struct gfb_data *)(hid_get_drvdata(hdev)))
+#define dev_get_gfbdata(dev) \
+	((struct gfb_data *)(dev_get_gdata(dev)->gfb_data))
 
 static uint32_t pseudo_palette[16];
 
 /* Unlock the urb so we can reuse it */
 static void gfb_fb_urb_completion(struct urb *urb)
-{ 
+{
         /* we need to unlock fb_vbitmap regardless of urb success status */
         unsigned long irq_flags;
         struct gfb_data *data = urb->context;
@@ -57,9 +57,39 @@ static void gfb_fb_urb_completion(struct urb *urb)
         spin_unlock_irqrestore(&data->fb_urb_lock, irq_flags);
 }
 
+static void gfb_free_framebuffer_work(struct work_struct *work)
+{
+	struct gfb_data *data = container_of(work, struct gfb_data,
+                                             free_framebuffer_work.work);
+	struct fb_info *info = data->fb_info;
+	/* int node = info->node; */
+
+	unregister_framebuffer(info);
+
+	if (info->cmap.len != 0)
+		fb_dealloc_cmap(&info->cmap);
+	if (info->monspecs.modedb)
+		fb_destroy_modedb(info->monspecs.modedb);
+	if (info->screen_base)
+		vfree(info->screen_base);
+
+	fb_destroy_modelist(&info->modelist);
+        fb_deferred_io_cleanup(info);
+
+	usb_free_urb(data->fb_urb);
+
+	vfree(data->fb_bitmap);
+	kfree(data->fb_vbitmap);
+	
+	framebuffer_release(info);
+
+        kfree(data);
+}
+
 /* Send the current framebuffer vbitmap as an interrupt message */
 static int gfb_fb_send(struct gfb_data *data)
 {
+
 	struct usb_interface *intf;
 	struct usb_device *usb_dev;
 	struct hid_device *hdev = data->hdev;
@@ -68,6 +98,9 @@ static int gfb_fb_send(struct gfb_data *data)
 	unsigned int pipe;
 	int retval = 0;
 	unsigned long irq_flags;
+
+        if (!atomic_read(&data->usb_active))
+		return -EPERM;
 
 	/*
 	 * Try and lock the framebuffer urb to prevent access if we have
@@ -285,7 +318,9 @@ static int gfb_fb_setcolreg(unsigned regno, unsigned red, unsigned green,
 			    unsigned blue, unsigned transp,
 			    struct fb_info *info)
 {
-	/* struct gfb_data *par = info->par; */
+	struct gfb_data *par = info->par;
+        if (!atomic_read(&par->usb_active))
+		return -EPERM;
 
 	if (regno >= 16)
 		return 1;
@@ -355,6 +390,32 @@ static void gfb_fb_imageblit(struct fb_info *info, const struct fb_image *image)
 	gfb_fb_update(par);
 }
 
+
+static int gfb_fb_open(struct fb_info *info, int user)
+{
+	struct gfb_data *dev = info->par;
+
+	/* If the USB device is gone, we don't accept new opens */
+	if (dev->virtualized)
+		return -ENODEV;
+	dev->fb_count++;
+	return 0;
+}
+
+
+static int gfb_fb_release(struct fb_info *info, int user)
+{
+	struct gfb_data *dev = info->par;
+
+	dev->fb_count--;
+
+	/* We can't free fb_info here - fbmem will touch it when we return */
+	if (dev->virtualized && (dev->fb_count == 0))
+		schedule_delayed_work(&dev->free_framebuffer_work, HZ);
+
+        return 0;
+}
+
 /*
  * this is the slow path from userspace. they can seek and write to
  * the fb. it's inefficient to do anything less than a full screen draw
@@ -373,8 +434,10 @@ static ssize_t gfb_fb_write(struct fb_info *info, const char __user *buf,
 
 static struct fb_ops gfb_ops = {
 	.owner = THIS_MODULE,
-	.fb_read = fb_sys_read,
-	.fb_write = gfb_fb_write,
+	.fb_read      = fb_sys_read,
+        .fb_open      = gfb_fb_open,
+        .fb_release   = gfb_fb_release,
+	.fb_write     = gfb_fb_write,
         .fb_setcolreg = gfb_fb_setcolreg,
 	.fb_fillrect  = gfb_fb_fillrect,
 	.fb_copyarea  = gfb_fb_copyarea,
@@ -384,40 +447,46 @@ static struct fb_ops gfb_ops = {
 /*
  * The "fb_node" attribute
  */
-static ssize_t gfb_fb_node_show(struct device *dev,
-				struct device_attribute *attr,
-				char *buf)
+ssize_t gfb_fb_node_show(struct device *dev,
+                         struct device_attribute *attr,
+                         char *buf)
 {
 	unsigned fb_node;
-	struct gfb_data *data = dev_get_drvdata(dev);
+        struct gfb_data *data = dev_get_gfbdata(dev);
+        if (!data)
+                return -ENODATA;
 
+        if (!atomic_read(&data->usb_active))
+		return -EPERM;
 	fb_node = data->fb_info->node;
 
 	return sprintf(buf, "%u\n", fb_node);
 }
-EXPORT_SYMBOL(gfb_fb_node_show);
+EXPORT_SYMBOL_GPL(gfb_fb_node_show);
 
 /*
  * The "fb_update_rate" attribute
  */
-static ssize_t gfb_fb_update_rate_show(struct device *dev,
-				       struct device_attribute *attr,
-				       char *buf)
+ssize_t gfb_fb_update_rate_show(struct device *dev,
+                                struct device_attribute *attr,
+                                char *buf)
 {
 	unsigned fb_update_rate;
-	struct gfb_data *data = dev_get_drvdata(dev);
+        struct gfb_data *data = dev_get_gfbdata(dev);
+        if (!data)
+                return -ENODATA;
 
+        if (!atomic_read(&data->usb_active))
+		return -EPERM;
 	fb_update_rate = data->fb_update_rate;
 
 	return sprintf(buf, "%u\n", fb_update_rate);
 }
-EXPORT_SYMBOL(gfb_fb_update_rate_show);
+EXPORT_SYMBOL_GPL(gfb_fb_update_rate_show);
 
-static ssize_t gfb_set_fb_update_rate(struct hid_device *hdev,
+static ssize_t gfb_set_fb_update_rate(struct gfb_data *data,
 				      unsigned fb_update_rate)
 {
-	struct gfb_data *data = hid_get_gfbdata(hdev);
-
 	if (fb_update_rate > GFB_UPDATE_RATE_LIMIT)
 		data->fb_update_rate = GFB_UPDATE_RATE_LIMIT;
 	else if (fb_update_rate == 0)
@@ -430,44 +499,40 @@ static ssize_t gfb_set_fb_update_rate(struct hid_device *hdev,
 	return 0;
 }
 
-static ssize_t gfb_fb_update_rate_store(struct device *dev,
-					struct device_attribute *attr,
-					const char *buf, size_t count)
+ssize_t gfb_fb_update_rate_store(struct device *dev,
+                                 struct device_attribute *attr,
+                                 const char *buf, size_t count)
 {
-	struct hid_device *hdev;
 	int i;
 	unsigned u;
 	ssize_t set_result;
 
-	/* Get the hid associated with the device */
-	hdev = container_of(dev, struct hid_device, dev);
-
-	/* If we have an invalid pointer we'll return ENODATA */
-	if (hdev == NULL || &(hdev->dev) != dev)
-		return -ENODATA;
+        struct gfb_data *data = dev_get_gfbdata(dev);
+        if (!data)
+                return -ENODATA;
 
 	i = sscanf(buf, "%u", &u);
 	if (i != 1) {
 		dev_warn(dev, GFB_NAME " unrecognized input: %s", buf);
-		return -1;
+		return -EINVAL;
 	}
 
-	set_result = gfb_set_fb_update_rate(hdev, u);
+	set_result = gfb_set_fb_update_rate(data, u);
 
 	if (set_result < 0)
 		return set_result;
 
 	return count;
 }
-EXPORT_SYMBOL(gfb_fb_update_rate_store);
+EXPORT_SYMBOL_GPL(gfb_fb_update_rate_store);
 
 static struct fb_deferred_io gfb_fb_defio = {
 	.delay = HZ / GFB_UPDATE_RATE_DEFAULT,
 	.deferred_io = gfb_fb_deferred_io,
 };
 
-static struct gfb_data *gfb_probe(struct hid_device *hdev,
-		     const int panel_type)
+struct gfb_data *gfb_probe(struct hid_device *hdev,
+                           const int panel_type)
 {
 	int error;
 	struct gfb_data *data;
@@ -544,7 +609,8 @@ static struct gfb_data *gfb_probe(struct hid_device *hdev,
 		dev_err(&hdev->dev, GFB_NAME ": ERROR: unknown panel type\n");
 		goto err_cleanup_fb;
 	}
-
+	INIT_DELAYED_WORK(&data->free_framebuffer_work,
+			  gfb_free_framebuffer_work);
         data->fb_info->pseudo_palette = &pseudo_palette;
 	data->fb_info->fbops = &gfb_ops;
 	data->fb_info->fix.smem_len = data->fb_info->fix.line_length * data->fb_info->var.yres;
@@ -592,6 +658,7 @@ static struct gfb_data *gfb_probe(struct hid_device *hdev,
 
 	if (register_framebuffer(data->fb_info) < 0)
 		goto err_cleanup_fb_deferred;
+	atomic_set(&data->usb_active, 1);
 
 	return data;
 
@@ -617,21 +684,24 @@ err_no_cleanup:
 
 	return 0;
 }
-EXPORT_SYMBOL(gfb_probe);
+EXPORT_SYMBOL_GPL(gfb_probe);
 
-static void gfb_remove(struct gfb_data *data)
+
+
+void gfb_remove(struct gfb_data *data)
 {
-	/* Clean up the framebuffer */
-	fb_deferred_io_cleanup(data->fb_info);
-	unregister_framebuffer(data->fb_info);
-	framebuffer_release(data->fb_info);
-	vfree(data->fb_bitmap);
-	kfree(data->fb_vbitmap);
-	usb_free_urb(data->fb_urb);
+        data->virtualized = true; // Device gone, we wont do any io
+	atomic_set(&data->usb_active, 0);
+
+        /* the rest of the cleanup is in gfb_free_framebuffer_work */
+        /* either now, or when the last file handle holding the fb gets closed */
+        if (data->fb_count == 0)
+                schedule_delayed_work(&data->free_framebuffer_work, HZ);
 }
-EXPORT_SYMBOL(gfb_remove);
+EXPORT_SYMBOL_GPL(gfb_remove);
 
 MODULE_DESCRIPTION("Logitech GFB HID Driver");
 MODULE_AUTHOR("Rick L Vinyard Jr (rvinyard@cs.nmsu.edu)");
 MODULE_AUTHOR("Alistair Buxton (a.j.buxton@gmail.com)");
+MODULE_AUTHOR("Thomas Berger (tbe@boreus.de)");
 MODULE_LICENSE("GPL");

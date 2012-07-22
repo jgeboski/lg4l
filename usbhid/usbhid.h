@@ -32,6 +32,7 @@
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <linux/input.h>
+#include <linux/version.h>
 
 /*  API provided by hid-core.c for USB HID drivers */
 int usbhid_wait_io(struct hid_device* hid);
@@ -42,6 +43,12 @@ void usbhid_submit_report
 (struct hid_device *hid, struct hid_report *report, unsigned char dir);
 int usbhid_get_power(struct hid_device *hid);
 void usbhid_put_power(struct hid_device *hid);
+struct usb_interface *usbhid_find_interface(int minor);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,39)
+struct usb_interface *usbhid_find_interface(int minor);
+#endif
+
 
 /* iofl flags */
 #define HID_CTRL_RUNNING	1
@@ -94,7 +101,9 @@ struct usbhid_device {
 	unsigned long stop_retry;                                       /* Time to give up, in jiffies */
 	unsigned int retry_delay;                                       /* Delay length in ms */
 	struct work_struct reset_work;                                  /* Task context for resets */
+	#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,39)
 	struct work_struct restart_work;				/* waking up for output to be done in a task */
+	#endif
 	wait_queue_head_t wait;						/* For sleeping */
 	int ledcount;							/* counting the number of active leds */
 };

@@ -33,7 +33,7 @@
 #include "hid-ids.h"
 #include "usbhid/usbhid.h"
 
-#include "hid-gfb.h"
+#include "hid-gcommon.h"
 
 #ifdef __GNUC__
 #define __UNUSED __attribute__ ((unused))
@@ -51,7 +51,9 @@
 #define G19_DEFAULT_RED (0)
 #define G19_DEFAULT_GREEN (255)
 #define G19_DEFAULT_BLUE (0)
+#define G19_DEFAULT_BRIGHTNESS (80)
 
+#define LED_COUNT 8
 /* LED array indices */
 #define G19_LED_M1 0
 #define G19_LED_M2 1
@@ -60,6 +62,7 @@
 #define G19_LED_BL_R 4
 #define G19_LED_BL_G 5
 #define G19_LED_BL_B 6
+#define G19_LED_BL_SCREEN 7
 
 #define G19_REPORT_4_INIT	0x00
 #define G19_REPORT_4_FINALIZE	0x01
@@ -79,28 +82,19 @@
 #define G19_RESET_MESSAGE_1 0x02
 #define G19_RESET_READY 0x03
 
-/* Per device data structure */
+/* G19 specific device data structure */
 struct g19_data {
 	/* HID reports */
-	struct hid_device *hdev;
 	struct hid_report *backlight_report;
 	struct hid_report *start_input_report;
 	struct hid_report *feature_report_4;
 	struct hid_report *led_report;
 	struct hid_report *output_report_3;
-	struct input_dev *input_dev;
 
 	/* core state */
-	char *name;
-	int keycode[G19_KEYMAP_SIZE];
-	int scancode_state[G19_KEYS];
 	u8 rgb[3];
 	u8 led;
-	u8 curkeymap;
-	u8 keymap_switching;
-
-	/* Framebuffer */
-	struct gfb_data *gfb_data;
+	u8 screen_bl;
 
 	/* none standard buttons stuff */
 	u8 ep1keys[2];
@@ -108,10 +102,9 @@ struct g19_data {
 	spinlock_t ep1_urb_lock;
 
 	/* LED stuff */
-	struct led_classdev *led_cdev[7];
+	struct led_classdev *led_cdev[LED_COUNT];
 
 	/* Housekeeping stuff */
-	spinlock_t lock;
 	struct completion ready;
 	int ready_stages;
 	int need_reset;
@@ -119,12 +112,10 @@ struct g19_data {
 
 /* Convenience macros */
 #define hid_get_g19data(hdev) \
-	((struct g19_data *)(hid_get_drvdata(hdev)))
+	((struct g19_data *)(hid_get_gdata(hdev)->data))
+#define dev_get_g19data(dev) \
+	((struct g19_data *)(dev_get_gdata(dev)->data))
 
-#define input_get_hdev(idev) \
-	((struct hid_device *)(input_get_drvdata(idev)))
-
-#define input_get_g19data(idev) (hid_get_g19data(input_get_hdev(idev)))
 
 /*
  * Keymap array indices
@@ -139,17 +130,14 @@ struct g19_data {
  * LIGHT      19
  */
 static const unsigned int g19_default_key_map[G19_KEYS] = {
-/*
   KEY_F1, KEY_F2, KEY_F3, KEY_F4,
   KEY_F5, KEY_F6, KEY_F7, KEY_F8,
   KEY_F9, KEY_F10, KEY_F11, KEY_F12,
-*/
-  KEY_RESERVED, KEY_RESERVED, KEY_RESERVED, KEY_RESERVED,
-  KEY_RESERVED, KEY_RESERVED, KEY_RESERVED, KEY_RESERVED,
-  KEY_RESERVED, KEY_RESERVED, KEY_RESERVED, KEY_RESERVED,
   /* M1, M2, M3, MR */
-  KEY_F21, KEY_F22, KEY_F23, KEY_F24,
+  KEY_PROG1, KEY_PROG2, KEY_PROG3, KEY_RECORD ,
   KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_KBDILLUMTOGGLE,
+
+
   KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
 
 /* Screen keymap
@@ -164,6 +152,7 @@ static const unsigned int g19_default_key_map[G19_KEYS] = {
  * Left  5
  * Down  6
  * Up    7
+ *
  */
 
 
@@ -178,49 +167,64 @@ static DEVICE_ATTR(fb_update_rate, 0666,
 		   gfb_fb_update_rate_show,
 		   gfb_fb_update_rate_store);
 
-static int g19_input_get_keycode(struct input_dev * dev,
-                                 unsigned int scancode,
-                                 unsigned int * keycode)
-{
-	int retval;
-	
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,37)
-	
-	struct input_keymap_entry ke = {
-		.flags    = 0,
-		.len      = sizeof(scancode),
-		.index    = scancode
-	};
-	
-	memcpy(&ke.scancode, &scancode, sizeof scancode);
-	retval   = input_get_keycode(dev, &ke);
-	*keycode = ke.keycode;
-	
-#else
-	
-	retval   = input_get_keycode(dev, scancode, keycode);
-	
-#endif
-	
-	return retval;
-}
-
 static void g19_led_send(struct hid_device *hdev)
 {
-	struct g19_data *data = hid_get_g19data(hdev);
+	struct g19_data *g19data = hid_get_g19data(hdev);
 
-	data->led_report->field[0]->value[0] = data->led&0xFF;
+	g19data->led_report->field[0]->value[0] = g19data->led&0xFF;
 
-	usbhid_submit_report(hdev, data->led_report, USB_DIR_OUT);
+	usbhid_submit_report(hdev, g19data->led_report, USB_DIR_OUT);
+}
+
+static void g19_screen_bl_send(struct hid_device *hdev)
+{
+	struct usb_interface *intf;
+	struct usb_device *usb_dev;
+	struct g19_data *g19data = hid_get_g19data(hdev);
+	unsigned int pipe;
+	int i = 0;
+
+	unsigned char cp[9];
+	cp[0] = g19data->screen_bl;
+	cp[1] = 0xe2;
+	cp[2] = 0x12;
+	cp[3] = 0x00;
+	cp[4] = 0x8c;
+	cp[5] = 0x11;
+	cp[6] = 0x00;
+	cp[7] = 0x10;
+	cp[8] = 0x00;
+
+	intf = to_usb_interface(hdev->dev.parent);
+	usb_dev = interface_to_usbdev(intf);
+	pipe = usb_sndctrlpipe(usb_dev, 0x00);
+	i = usb_control_msg(usb_dev, pipe, 0x0a,
+			USB_TYPE_VENDOR | USB_RECIP_INTERFACE, 0, 0, cp, sizeof(cp),
+			1 * HZ);
+	if (i < 0) {
+		dev_warn(&hdev->dev, G19_NAME " error setting LCD backlight level %d\n",
+				i);
+	}
+}
+
+static void g19_rgb_send(struct hid_device *hdev)
+{
+	struct g19_data *g19data = hid_get_g19data(hdev);
+
+	g19data->backlight_report->field[0]->value[0] = g19data->rgb[0];
+	g19data->backlight_report->field[0]->value[1] = g19data->rgb[1];
+	g19data->backlight_report->field[0]->value[2] = g19data->rgb[2];
+
+	usbhid_submit_report(hdev, g19data->backlight_report, USB_DIR_OUT);
 }
 
 static void g19_led_set(struct led_classdev *led_cdev,
-			 enum led_brightness value,
-			 int led_num)
+                        enum led_brightness value,
+                        int led_num)
 {
 	struct device *dev;
 	struct hid_device *hdev;
-	struct g19_data *data;
+	struct g19_data *g19data;
 	u8 mask;
 
 	/* Get the device associated with the led */
@@ -230,13 +234,13 @@ static void g19_led_set(struct led_classdev *led_cdev,
 	hdev = container_of(dev, struct hid_device, dev);
 
 	/* Get the underlying data value */
-	data = hid_get_g19data(hdev);
+	g19data = hid_get_g19data(hdev);
 
 	mask = 0x80>>led_num;
 	if (value)
-		data->led |= mask;
+		g19data->led |= mask;
 	else
-		data->led &= ~mask;
+		g19data->led &= ~mask;
 
 	g19_led_send(hdev);
 }
@@ -265,11 +269,48 @@ static void g19_led_mr_brightness_set(struct led_classdev *led_cdev,
 	g19_led_set(led_cdev, value, G19_LED_MR);
 }
 
+static void g19_screen_bl_set(struct led_classdev *led_cdev,
+                              enum led_brightness value)
+{
+
+	struct device *dev;
+	struct hid_device *hdev;
+	struct g19_data *g19data;
+
+	/* Get the device associated with the led */
+	dev = led_cdev->dev->parent;
+	// TEMPORARY
+
+	/* Get the hid associated with the device */
+	hdev = container_of(dev, struct hid_device, dev);
+
+	/* Get the underlying data value */
+	g19data = hid_get_g19data(hdev);
+
+
+//    data = [val, 0xe2, 0x12, 0x00, 0x8c, 0x11, 0x00, 0x10, 0x00]
+//    rtype = usb.TYPE_VENDOR | usb.RECIP_INTERFACE
+//    self.__usbDeviceMutex.acquire()
+//    try:
+//        self.__usbDevice.handleIf1.controlMsg(rtype, 0x0a, data, 0x0, 0x0, self.__write_timeout)
+//    finally:
+//        self.__usbDeviceMutex.release()
+
+	if (led_cdev == g19data->led_cdev[G19_LED_BL_SCREEN]) {
+		if (value > 100)
+			value = 100;
+		// TEMPORARY
+		g19data->screen_bl = value;
+		g19_screen_bl_send(hdev);
+	} else
+		dev_info(dev, G19_NAME " error retrieving LED brightness\n");
+}
+
 static enum led_brightness g19_led_brightness_get(struct led_classdev *led_cdev)
 {
 	struct device *dev;
 	struct hid_device *hdev;
-	struct g19_data *data;
+	struct g19_data *g19data;
 	int value = 0;
 
 	/* Get the device associated with the led */
@@ -279,16 +320,16 @@ static enum led_brightness g19_led_brightness_get(struct led_classdev *led_cdev)
 	hdev = container_of(dev, struct hid_device, dev);
 
 	/* Get the underlying data value */
-	data = hid_get_g19data(hdev);
+	g19data = hid_get_g19data(hdev);
 
-	if (led_cdev == data->led_cdev[G19_LED_M1])
-		value = data->led & 0x80;
-	else if (led_cdev == data->led_cdev[G19_LED_M2])
-		value = data->led & 0x40;
-	else if (led_cdev == data->led_cdev[G19_LED_M3])
-		value = data->led & 0x20;
-	else if (led_cdev == data->led_cdev[G19_LED_MR])
-		value = data->led & 0x10;
+	if (led_cdev == g19data->led_cdev[G19_LED_M1])
+		value = g19data->led & 0x80;
+	else if (led_cdev == g19data->led_cdev[G19_LED_M2])
+		value = g19data->led & 0x40;
+	else if (led_cdev == g19data->led_cdev[G19_LED_M3])
+		value = g19data->led & 0x20;
+	else if (led_cdev == g19data->led_cdev[G19_LED_MR])
+		value = g19data->led & 0x10;
 	else
 		dev_info(dev, G19_NAME " error retrieving LED brightness\n");
 
@@ -297,23 +338,12 @@ static enum led_brightness g19_led_brightness_get(struct led_classdev *led_cdev)
 	return LED_OFF;
 }
 
-static void g19_rgb_send(struct hid_device *hdev)
-{
-	struct g19_data *data = hid_get_g19data(hdev);
-
-	data->backlight_report->field[0]->value[0] = data->rgb[0];
-	data->backlight_report->field[0]->value[1] = data->rgb[1];
-	data->backlight_report->field[0]->value[2] = data->rgb[2];
-
-	usbhid_submit_report(hdev, data->backlight_report, USB_DIR_OUT);
-}
-
 static void g19_led_bl_brightness_set(struct led_classdev *led_cdev,
-				      unsigned int value)
+				      enum led_brightness value)
 {
 	struct device *dev;
 	struct hid_device *hdev;
-	struct g19_data *data;
+	struct g19_data *g19data;
 
 	/* Get the device associated with the led */
 	dev = led_cdev->dev->parent;
@@ -322,23 +352,23 @@ static void g19_led_bl_brightness_set(struct led_classdev *led_cdev,
 	hdev = container_of(dev, struct hid_device, dev);
 
 	/* Get the underlying data value */
-	data = hid_get_g19data(hdev);
+	g19data = hid_get_g19data(hdev);
 
-	if (led_cdev == data->led_cdev[G19_LED_BL_R])
-		data->rgb[0] = value;
-	else if (led_cdev == data->led_cdev[G19_LED_BL_G])
-		data->rgb[1] = value;
-	else if (led_cdev == data->led_cdev[G19_LED_BL_B])
-		data->rgb[2] = value;
+	if (led_cdev == g19data->led_cdev[G19_LED_BL_R])
+		g19data->rgb[0] = value;
+	else if (led_cdev == g19data->led_cdev[G19_LED_BL_G])
+		g19data->rgb[1] = value;
+	else if (led_cdev == g19data->led_cdev[G19_LED_BL_B])
+		g19data->rgb[2] = value;
 
 	g19_rgb_send(hdev);
 }
 
-static unsigned int g19_led_bl_brightness_get(struct led_classdev *led_cdev)
+static enum led_brightness g19_led_bl_brightness_get(struct led_classdev *led_cdev)
 {
 	struct device *dev;
 	struct hid_device *hdev;
-	struct g19_data *data;
+	struct g19_data *g19data;
 
 	/* Get the device associated with the led */
 	dev = led_cdev->dev->parent;
@@ -347,21 +377,44 @@ static unsigned int g19_led_bl_brightness_get(struct led_classdev *led_cdev)
 	hdev = container_of(dev, struct hid_device, dev);
 
 	/* Get the underlying data value */
-	data = hid_get_g19data(hdev);
+	g19data = hid_get_g19data(hdev);
 
-	if (led_cdev == data->led_cdev[G19_LED_BL_R])
-		return data->rgb[0];
-	else if (led_cdev == data->led_cdev[G19_LED_BL_G])
-		return data->rgb[1];
-	else if (led_cdev == data->led_cdev[G19_LED_BL_B])
-		return data->rgb[2];
+	if (led_cdev == g19data->led_cdev[G19_LED_BL_R])
+		return g19data->rgb[0];
+	else if (led_cdev == g19data->led_cdev[G19_LED_BL_G])
+		return g19data->rgb[1];
+	else if (led_cdev == g19data->led_cdev[G19_LED_BL_B])
+		return g19data->rgb[2];
 	else
 		dev_info(dev, G19_NAME " error retrieving LED brightness\n");
-	return 0;
+		
+	return LED_OFF;
+}
+static enum led_brightness g19_screen_bl_get(struct led_classdev *led_cdev)
+{
+	struct device *dev;
+	struct hid_device *hdev;
+	struct g19_data *g19data;
+
+	/* Get the device associated with the led */
+	dev = led_cdev->dev->parent;
+
+	/* Get the hid associated with the device */
+	hdev = container_of(dev, struct hid_device, dev);
+
+	/* Get the underlying data value */
+	g19data = hid_get_g19data(hdev);
+
+	if (led_cdev == g19data->led_cdev[G19_LED_BL_SCREEN])
+		return g19data->screen_bl;
+	else
+		dev_info(dev, G19_NAME " error retrieving LED brightness\n");
+
+	return LED_OFF;
 }
 
 
-static const struct led_classdev g19_led_cdevs[7] = {
+static const struct led_classdev g19_led_cdevs[LED_COUNT] = {
 	{
 		.brightness_set		= g19_led_m1_brightness_set,
 		.brightness_get		= g19_led_brightness_get,
@@ -390,348 +443,50 @@ static const struct led_classdev g19_led_cdevs[7] = {
 		.brightness_set		= g19_led_bl_brightness_set,
 		.brightness_get		= g19_led_bl_brightness_get,
 	},
+	{
+		.brightness_set		= g19_screen_bl_set,
+		.brightness_get		= g19_screen_bl_get,
+	},
 };
 
-static int g19_input_setkeycode(struct input_dev *dev,
-				int scancode,
-				int keycode)
-{
-	unsigned long irq_flags;
-	int old_keycode;
-	int i;
-	struct g19_data *data = input_get_g19data(dev);
-
-	if (scancode >= dev->keycodemax)
-		return -EINVAL;
-
-	spin_lock_irqsave(&data->lock, irq_flags);
-
-	old_keycode = data->keycode[scancode];
-	data->keycode[scancode] = keycode;
-
-	__clear_bit(old_keycode, dev->keybit);
-	__set_bit(keycode, dev->keybit);
-
-	for (i = 0; i < dev->keycodemax; i++) {
-		if (data->keycode[i] == old_keycode) {
-			__set_bit(old_keycode, dev->keybit);
-			break; /* Setting the bit twice is useless, so break*/
-		}
-	}
-
-	spin_unlock_irqrestore(&data->lock, irq_flags);
-
-	return 0;
-}
-
-static int g19_input_getkeycode(struct input_dev *dev,
-				int scancode,
-				int *keycode)
-{
-	struct g19_data *data = input_get_g19data(dev);
-
-	if (!dev->keycodesize)
-		return -EINVAL;
-
-	if (scancode >= dev->keycodemax)
-		return -EINVAL;
-
-	*keycode = data->keycode[scancode];
-
-	return 0;
-}
-
-/*
- * The "keymap" attribute
- */
-static ssize_t g19_keymap_index_show(struct device *dev,
-				     struct device_attribute *attr,
-				     char *buf)
-{
-	struct g19_data *data = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%u\n", data->curkeymap);
-}
-
-static ssize_t g19_set_keymap_index(struct hid_device *hdev, unsigned k)
-{
-	int scancode;
-	int offset_old;
-	int offset_new;
-	int keycode_old;
-	int keycode_new;
-	struct g19_data *data = hid_get_g19data(hdev);
-	struct input_dev *idev = data->input_dev;
-
-	if (k > 2)
-		return -EINVAL;
-
-	/*
-	 * Release all the pressed keys unless the new keymap has the same key
-	 * in the same scancode position.
-	 *
-	 * Also, clear the scancode state unless the new keymap has the same
-	 * key in the same scancode position.
-	 *
-	 * This allows a keycode mapped to the same scancode in two different
-	 * keymaps to remain pressed without a key up code when the keymap is
-	 * switched.
-	 */
-	offset_old = G19_KEYS * data->curkeymap;
-	offset_new = G19_KEYS * k;
-	for (scancode = 0; scancode < G19_KEYS; scancode++) {
-		keycode_old = data->keycode[offset_old+scancode];
-		keycode_new = data->keycode[offset_new+scancode];
-		if (keycode_old != keycode_new) {
-			if (keycode_old != KEY_RESERVED)
-				input_report_key(idev, keycode_old, 0);
-			data->scancode_state[scancode] = 0;
-		}
-	}
-
-	data->curkeymap = k;
-
-	if (data->keymap_switching) {
-		data->led = 1 << k;
-		g19_led_send(hdev);
-	}
-
-	return 0;
-}
-
-static ssize_t g19_keymap_index_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count)
-{
-	struct hid_device *hdev;
-	int i;
-	unsigned k;
-	ssize_t set_result;
-
-	/* Get the hid associated with the device */
-	hdev = container_of(dev, struct hid_device, dev);
-
-	/* If we have an invalid pointer we'll return ENODATA */
-	if (hdev == NULL || &(hdev->dev) != dev)
-		return -ENODATA;
-
-	i = sscanf(buf, "%u", &k);
-	if (i != 1) {
-		dev_warn(dev, G19_NAME " unrecognized input: %s", buf);
-		return -1;
-	}
-
-	set_result = g19_set_keymap_index(hdev, k);
-
-	if (set_result < 0)
-		return set_result;
-
-	return count;
-}
-
 static DEVICE_ATTR(keymap_index, 0666,
-		   g19_keymap_index_show,
-		   g19_keymap_index_store);
+		   ginput_keymap_index_show,
+		   ginput_keymap_index_store);
 
-/*
- * The "keycode" attribute
- */
-static ssize_t g19_keymap_show(struct device *dev,
-			       struct device_attribute *attr,
-			       char *buf)
-{
-	int offset = 0;
-	int result;
-	int scancode;
-	int keycode;
-	int error;
-
-	struct g19_data *data = dev_get_drvdata(dev);
-
-	for (scancode = 0; scancode < G19_KEYMAP_SIZE; scancode++) {
-		error = g19_input_get_keycode(data->input_dev, scancode, &keycode);
-		if (error) {
-			dev_warn(dev, G19_NAME " error accessing scancode %d\n",
-				 scancode);
-			continue;
-		}
-
-		result = sprintf(buf+offset, "0x%03x 0x%04x\n",
-				 scancode, keycode);
-		if (result < 0)
-			return -EINVAL;
-		offset += result;
-	}
-
-	return offset+1;
-}
-
-static ssize_t g19_keymap_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t count)
-{
-	struct hid_device *hdev;
-	int scanned;
-	int consumed;
-	int scancd;
-	int keycd;
-	int error;
-	int set = 0;
-	int gkey;
-	int index;
-	int good;
-	struct g19_data *data;
-
-	/* Get the hid associated with the device */
-	hdev = container_of(dev, struct hid_device, dev);
-
-	/* If we have an invalid pointer we'll return ENODATA */
-	if (hdev == NULL || &(hdev->dev) != dev)
-		return -ENODATA;
-
-	/* Now, let's get the data structure */
-	data = hid_get_g19data(hdev);
-
-	do {
-		good = 0;
-
-		/* Look for scancode keycode pair in hex */
-		scanned = sscanf(buf, "%x %x%n", &scancd, &keycd, &consumed);
-		if (scanned == 2) {
-			buf += consumed;
-			error = g19_input_setkeycode(data->input_dev, scancd, keycd);
-			if (error)
-				goto err_input_setkeycode;
-			set++;
-			good = 1;
-		} else {
-			/*
-			 * Look for Gkey keycode pair and assign to current
-			 * keymap
-			 */
-			scanned = sscanf(buf, "G%d %x%n", &gkey, &keycd, &consumed);
-			if (scanned == 2 && gkey > 0 && gkey <= G19_KEYS) {
-				buf += consumed;
-				scancd = data->curkeymap * G19_KEYS + gkey - 1;
-				error = g19_input_setkeycode(data->input_dev, scancd, keycd);
-				if (error)
-					goto err_input_setkeycode;
-				set++;
-				good = 1;
-			} else {
-				/*
-				 * Look for Gkey-index keycode pair and assign
-				 * to indexed keymap
-				 */
-				scanned = sscanf(buf, "G%d-%d %x%n", &gkey, &index, &keycd, &consumed);
-				if (scanned == 3 &&
-				    gkey > 0 && gkey <= G19_KEYS &&
-				    index >= 0 && index <= 2) {
-					buf += consumed;
-					scancd = index * G19_KEYS + gkey - 1;
-					error = g19_input_setkeycode(data->input_dev, scancd, keycd);
-					if (error)
-						goto err_input_setkeycode;
-					set++;
-					good = 1;
-				}
-			}
-		}
-
-	} while (good);
-
-	if (set == 0) {
-		dev_warn(dev, G19_NAME " unrecognized keycode input: %s", buf);
-		return -1;
-	}
-
-	return count;
-
-err_input_setkeycode:
-	dev_warn(dev, G19_NAME " error setting scancode %d to keycode %d\n",
-		 scancd, keycd);
-	return error;
-}
-
-static DEVICE_ATTR(keymap, 0666, g19_keymap_show, g19_keymap_store);
-
-/*
- * The "keymap_switching" attribute
- */
-static ssize_t g19_keymap_switching_show(struct device *dev,
-					 struct device_attribute *attr,
-					 char *buf)
-{
-	struct g19_data *data = dev_get_drvdata(dev);
-
-	return sprintf(buf, "%u\n", data->keymap_switching);
-}
-
-static ssize_t g19_set_keymap_switching(struct hid_device *hdev, unsigned k)
-{
-	struct g19_data *data = hid_get_g19data(hdev);
-
-	data->keymap_switching = k;
-
-	if (data->keymap_switching) {
-		data->led = 1 << data->curkeymap;
-		g19_led_send(hdev);
-	}
-
-	return 0;
-}
-
-static ssize_t g19_keymap_switching_store(struct device *dev,
-					  struct device_attribute *attr,
-					  const char *buf, size_t count)
-{
-	struct hid_device *hdev;
-	int i;
-	unsigned k;
-	ssize_t set_result;
-
-	/* Get the hid associated with the device */
-	hdev = container_of(dev, struct hid_device, dev);
-
-	/* If we have an invalid pointer we'll return ENODATA */
-	if (hdev == NULL || &(hdev->dev) != dev)
-		return -ENODATA;
-
-	i = sscanf(buf, "%u", &k);
-	if (i != 1) {
-		dev_warn(dev, G19_NAME "unrecognized input: %s", buf);
-		return -1;
-	}
-
-	set_result = g19_set_keymap_switching(hdev, k);
-
-	if (set_result < 0)
-		return set_result;
-
-	return count;
-}
+static DEVICE_ATTR(keymap, 0666, 
+                   ginput_keymap_show, 
+                   ginput_keymap_store);
 
 static DEVICE_ATTR(keymap_switching, 0644,
-		   g19_keymap_switching_show,
-		   g19_keymap_switching_store);
+		   ginput_keymap_switching_show,
+		   ginput_keymap_switching_store);
 
+/* change leds when the keymap was changed */
+static void g19_notify_keymap_switched(struct gcommon_data * gdata, 
+                                       unsigned int index)
+{
+        struct g19_data *g19data = gdata->data;
+
+        g19data->led = 1 << index;
+        g19_led_send(gdata->hdev);
+}
 
 static ssize_t g19_name_show(struct device *dev,
 			     struct device_attribute *attr,
 			     char *buf)
 {
-  unsigned long irq_flags;
-	struct g19_data *data = dev_get_drvdata(dev);
+	unsigned long irq_flags;
+	struct gcommon_data *gdata = dev_get_gdata(dev);
 	int result;
 
-	if (data->name == NULL) {
+	if (gdata->name == NULL) {
 		buf[0] = 0x00;
 		return 1;
 	}
 
-	spin_lock_irqsave(&data->lock, irq_flags);
-	result = sprintf(buf, "%s", data->name);
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	spin_lock_irqsave(&gdata->lock, irq_flags);
+	result = sprintf(buf, "%s", gdata->name);
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 
 	return result;
 }
@@ -740,16 +495,16 @@ static ssize_t g19_name_store(struct device *dev,
 			      struct device_attribute *attr,
 			      const char *buf, size_t count)
 {
-  unsigned long irq_flags;
-	struct g19_data *data = dev_get_drvdata(dev);
+        unsigned long irq_flags;
+	struct gcommon_data *gdata = dev_get_gdata(dev);
 	size_t limit = count;
 	char *end;
 
-	spin_lock_irqsave(&data->lock, irq_flags);
+	spin_lock_irqsave(&gdata->lock, irq_flags);
 
-	if (data->name != NULL) {
-		kfree(data->name);
-		data->name = NULL;
+	if (gdata->name != NULL) {
+		kfree(gdata->name);
+		gdata->name = NULL;
 	}
 
 	end = strpbrk(buf, "\n\r");
@@ -761,12 +516,12 @@ static ssize_t g19_name_store(struct device *dev,
 		if (limit > 100)
 			limit = 100;
 
-		data->name = kzalloc(limit+1, GFP_ATOMIC);
+		gdata->name = kzalloc(limit+1, GFP_ATOMIC);
 
-		strncpy(data->name, buf, limit);
+		strncpy(gdata->name, buf, limit);
 	}
 
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 
 	return count;
 }
@@ -775,23 +530,23 @@ static DEVICE_ATTR(name, 0666, g19_name_show, g19_name_store);
 
 static void g19_feature_report_4_send(struct hid_device *hdev, int which)
 {
-	struct g19_data *data = hid_get_g19data(hdev);
+	struct g19_data *g19data = hid_get_g19data(hdev);
 
 	if (which == G19_REPORT_4_INIT) {
-		data->feature_report_4->field[0]->value[0] = 0x02;
-		data->feature_report_4->field[0]->value[1] = 0x00;
-		data->feature_report_4->field[0]->value[2] = 0x00;
-		data->feature_report_4->field[0]->value[3] = 0x00;
+		g19data->feature_report_4->field[0]->value[0] = 0x02;
+		g19data->feature_report_4->field[0]->value[1] = 0x00;
+		g19data->feature_report_4->field[0]->value[2] = 0x00;
+		g19data->feature_report_4->field[0]->value[3] = 0x00;
 	} else if (which == G19_REPORT_4_FINALIZE) {
-		data->feature_report_4->field[0]->value[0] = 0x02;
-		data->feature_report_4->field[0]->value[1] = 0x80;
-		data->feature_report_4->field[0]->value[2] = 0x00;
-		data->feature_report_4->field[0]->value[3] = 0xFF;
+		g19data->feature_report_4->field[0]->value[0] = 0x02;
+		g19data->feature_report_4->field[0]->value[1] = 0x80;
+		g19data->feature_report_4->field[0]->value[2] = 0x00;
+		g19data->feature_report_4->field[0]->value[3] = 0xFF;
 	} else {
 		return;
 	}
 
-	usbhid_submit_report(hdev, data->feature_report_4, USB_DIR_OUT);
+	usbhid_submit_report(hdev, g19data->feature_report_4, USB_DIR_OUT);
 }
 
 /*
@@ -801,9 +556,9 @@ static ssize_t g19_minor_show(struct device *dev,
 			      struct device_attribute *attr,
 			      char *buf)
 {
-	struct g19_data *data = dev_get_drvdata(dev);
+	struct gcommon_data *gdata = dev_get_gdata(dev);
 
-	return sprintf(buf, "%d\n", data->hdev->minor);
+	return sprintf(buf, "%d\n", gdata->hdev->minor);
 }
 
 static DEVICE_ATTR(minor, 0444, g19_minor_show, NULL);
@@ -834,40 +589,12 @@ static struct attribute_group g19_attr_group = {
 };
 
 
-
-static void g19_handle_key_event(struct g19_data *data,
-				 struct input_dev *idev,
-				 int scancode,
-				 int value)
-{
-	int error;
-	int keycode;
-	int offset;
-
-	offset = G19_KEYS * data->curkeymap;
-
-	error = g19_input_get_keycode(idev, scancode+offset, &keycode);
-
-	if (unlikely(error)) {
-		dev_warn(&idev->dev, G19_NAME " error in input_get_keycode(): scancode=%d\n", scancode);
-		return;
-	}
-
-	/* Only report mapped keys */
-	if (keycode != KEY_RESERVED)
-		input_report_key(idev, keycode, value);
-	/* Or report MSC_SCAN on keypress of an unmapped key */
-/*	else if (data->scancode_state[scancode] == 0 && value)
-		input_event(idev, EV_MSC, MSC_SCAN, scancode);
-*/
-	data->scancode_state[scancode] = value;
-}
-
 static void g19_raw_event_process_input(struct hid_device *hdev,
-					struct g19_data *data,
+					struct gcommon_data *gdata,
 					u8 *raw_data)
 {
-	struct input_dev *idev = data->input_dev;
+	struct input_dev *idev = gdata->input_dev;
+        struct ginput_data *input_data = &gdata->input_data;
 	int scancode;
 	int value;
 	int i;
@@ -878,34 +605,31 @@ static void g19_raw_event_process_input(struct hid_device *hdev,
 	 * the remainder of the key data. That way the new keymap will
 	 * be loaded if there is a keymap switch.
 	 */
-/*
-	if (unlikely(data->keymap_switching)) {
-		if (data->curkeymap != 0 && raw_data[2] & 0x10)
-			g19_set_keymap_index(hdev, 0);
-		else if (data->curkeymap != 1 && raw_data[2] & 0x20)
-			g19_set_keymap_index(hdev, 1);
-		else if (data->curkeymap != 2 && raw_data[2] & 0x40)
-			g19_set_keymap_index(hdev, 2);
+	if (unlikely(input_data->keymap_switching)) {
+		if (input_data->curkeymap != 0 && raw_data[2] & 0x10)
+			ginput_set_keymap_index(gdata, 0);
+		else if (input_data->curkeymap != 1 && raw_data[2] & 0x20)
+			ginput_set_keymap_index(gdata, 1);
+		else if (input_data->curkeymap != 2 && raw_data[2] & 0x40)
+			ginput_set_keymap_index(gdata, 2);
 	}
-*/
 	raw_data[3] &= 0xBF; /* bit 6 is always on */
 
 	for (i = 0, mask = 0x01; i < 8; i++, mask <<= 1) {
 		/* Keys G1 through G8 */
 		scancode = i;
 		value = raw_data[1] & mask;
-		g19_handle_key_event(data, idev, scancode, value);
+		ginput_handle_key_event(gdata, scancode, value);
 
-		/* Keys G9 through G16 */
+		/* Keys G9 through G12, M1 through MR */
 		scancode = i + 8;
 		value = raw_data[2] & mask;
-		g19_handle_key_event(data, idev, scancode, value);
+		ginput_handle_key_event(gdata, scancode, value);
 
 		/* Keys G17 through G22 */
 		scancode = i + 16;
 		value = raw_data[3] & mask;
-		g19_handle_key_event(data, idev, scancode, value);
-
+		ginput_handle_key_event(gdata, scancode, value);
 	}
 
 	input_sync(idev);
@@ -915,75 +639,75 @@ static int g19_raw_event(struct hid_device *hdev,
 			 struct hid_report *report,
 			 u8 *raw_data, int size)
 {
-  unsigned long irq_flags;
+	unsigned long irq_flags;
 
        /*
 	* On initialization receive a 258 byte message with
 	* data = 6 0 255 255 255 255 255 255 255 255 ...
 	*/
-	struct g19_data *data;
-	data = dev_get_drvdata(&hdev->dev);
+	struct gcommon_data *gdata = dev_get_gdata(&hdev->dev);
+	struct g19_data *g19data = gdata->data;
 
-	spin_lock_irqsave(&data->lock, irq_flags);
+	spin_lock_irqsave(&gdata->lock, irq_flags);
 
-	if (unlikely(data->need_reset)) {
+	if (unlikely(g19data->need_reset)) {
 		g19_rgb_send(hdev);
 		g19_led_send(hdev);
-		data->need_reset = 0;
-		spin_unlock_irqrestore(&data->lock, irq_flags);
+		g19data->need_reset = 0;
+		spin_unlock_irqrestore(&gdata->lock, irq_flags);
 		return 1;
 	}
 
-	if (unlikely(data->ready_stages != G19_READY_STAGE_3)) {
+	if (unlikely(g19data->ready_stages != G19_READY_STAGE_3)) {
 		switch (report->id) {
 		case 6:
-			if (!(data->ready_stages & G19_READY_SUBSTAGE_1))
-				data->ready_stages |= G19_READY_SUBSTAGE_1;
-			else if (data->ready_stages & G19_READY_SUBSTAGE_4 &&
-				 !(data->ready_stages & G19_READY_SUBSTAGE_5)
+			if (!(g19data->ready_stages & G19_READY_SUBSTAGE_1))
+				g19data->ready_stages |= G19_READY_SUBSTAGE_1;
+			else if (g19data->ready_stages & G19_READY_SUBSTAGE_4 &&
+				 !(g19data->ready_stages & G19_READY_SUBSTAGE_5)
 				)
-				data->ready_stages |= G19_READY_SUBSTAGE_5;
-			else if (data->ready_stages & G19_READY_SUBSTAGE_6 &&
+				g19data->ready_stages |= G19_READY_SUBSTAGE_5;
+			else if (g19data->ready_stages & G19_READY_SUBSTAGE_6 &&
 				 raw_data[1] >= 0x80)
-				data->ready_stages |= G19_READY_SUBSTAGE_7;
+				g19data->ready_stages |= G19_READY_SUBSTAGE_7;
 			break;
 		case 1:
-			if (!(data->ready_stages & G19_READY_SUBSTAGE_2))
-				data->ready_stages |= G19_READY_SUBSTAGE_2;
+			if (!(g19data->ready_stages & G19_READY_SUBSTAGE_2))
+				g19data->ready_stages |= G19_READY_SUBSTAGE_2;
 			else
-				data->ready_stages |= G19_READY_SUBSTAGE_3;
+				g19data->ready_stages |= G19_READY_SUBSTAGE_3;
 			break;
 		}
 
-		if (data->ready_stages == G19_READY_STAGE_1 ||
-		    data->ready_stages == G19_READY_STAGE_2 ||
-		    data->ready_stages == G19_READY_STAGE_3)
-			complete_all(&data->ready);
+		if (g19data->ready_stages == G19_READY_STAGE_1 ||
+		    g19data->ready_stages == G19_READY_STAGE_2 ||
+		    g19data->ready_stages == G19_READY_STAGE_3)
+			complete_all(&g19data->ready);
 
-		spin_unlock_irqrestore(&data->lock, irq_flags);
+		spin_unlock_irqrestore(&gdata->lock, irq_flags);
 		return 1;
 	}
 
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 
 	if (likely(report->id == 2)) {
-		g19_raw_event_process_input(hdev, data, raw_data);
+		g19_raw_event_process_input(hdev, gdata, raw_data);
 		return 1;
 	}
 
 	return 0;
 }
 
-static void g19_initialize_keymap(struct g19_data *data)
+static void g19_initialize_keymap(struct gcommon_data *gdata)
 {
 	int i;
 
 	for (i = 0; i < G19_KEYS; i++) {
-		data->keycode[i] = g19_default_key_map[i];
-		__set_bit(data->keycode[i], data->input_dev->keybit);
+		gdata->input_data.keycode[i] = g19_default_key_map[i];
+		__set_bit(gdata->input_data.keycode[i], gdata->input_dev->keybit);
 	}
 
-	__clear_bit(KEY_RESERVED, data->input_dev->keybit);
+	__clear_bit(KEY_RESERVED, gdata->input_dev->keybit);
 }
 
 /* Unlock the urb so we can reuse it */
@@ -992,15 +716,15 @@ static void g19_ep1_urb_completion(struct urb *urb)
         /* don't process unlinked or failed urbs */
         if (likely(urb->status == 0)) {
 	        struct hid_device *hdev = urb->context;
-                struct g19_data *data = hid_get_g19data(hdev);
-                struct input_dev *idev = data->input_dev;
+                struct gcommon_data *gdata = hid_get_gdata(hdev);
+                struct g19_data *g19data = gdata->data;
                 int i;
 
                 for (i = 0; i < 8; i++)
-		        g19_handle_key_event(data, idev, 24+i, data->ep1keys[0]&(1<<i));
+		        ginput_handle_key_event(gdata, 24+i, g19data->ep1keys[0]&(1<<i));
 
-                input_sync(idev);
-                
+                input_sync(gdata->input_dev);
+
                 usb_submit_urb(urb, GFP_ATOMIC);
         }
 }
@@ -1009,7 +733,7 @@ static int g19_ep1_read(struct hid_device *hdev)
 {
 	struct usb_interface *intf;
 	struct usb_device *usb_dev;
-	struct g19_data *data = hid_get_g19data(hdev);
+	struct g19_data *g19data = hid_get_g19data(hdev);
 
 	struct usb_host_endpoint *ep;
 	unsigned int pipe;
@@ -1025,45 +749,23 @@ static int g19_ep1_read(struct hid_device *hdev)
 	if (unlikely(!ep))
 		return -EINVAL;
 
-	usb_fill_int_urb(data->ep1_urb, usb_dev, pipe, data->ep1keys, 2,
+	usb_fill_int_urb(g19data->ep1_urb, usb_dev, pipe, g19data->ep1keys, 2,
 			 g19_ep1_urb_completion, NULL, 10);
-	data->ep1_urb->context = hdev;
-	data->ep1_urb->actual_length = 0;
+	g19data->ep1_urb->context = hdev;
+	g19data->ep1_urb->actual_length = 0;
 
-	retval = usb_submit_urb(data->ep1_urb, GFP_KERNEL);
+	retval = usb_submit_urb(g19data->ep1_urb, GFP_KERNEL);
 
 	return retval;
 }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,37)
-
-static int g19_input_setkeycode_new(struct input_dev * dev,
-                                    const struct input_keymap_entry * ke,
-                                    unsigned int * old_keycode)
-{
-	int scancode;
-	
-	memcpy(&scancode, &ke->scancode, sizeof scancode);
-	return g19_input_setkeycode(dev, scancode, ke->keycode);
-}
-
-static int g19_input_getkeycode_new(struct input_dev * dev,
-                                    struct input_keymap_entry * ke)
-{
-	int scancode;
-	
-	memcpy(&scancode, ke->scancode, sizeof scancode);
-	return g19_input_getkeycode(dev, scancode, &ke->keycode);
-}
-
-#endif
 
 static int g19_probe(struct hid_device *hdev,
 		     const struct hid_device_id *id)
 {
 	unsigned long irq_flags;
 	int error;
-	struct g19_data *data;
+	struct gcommon_data *gdata;
+	struct g19_data *g19data;
 	int i;
 	int led_num;
 	struct usb_interface *intf;
@@ -1083,27 +785,35 @@ static int g19_probe(struct hid_device *hdev,
 	 * Let's allocate the g19 data structure, set some reasonable
 	 * defaults, and associate it with the device
 	 */
-	data = kzalloc(sizeof(struct g19_data), GFP_KERNEL);
-	if (data == NULL) {
+	gdata = kzalloc(sizeof(struct gcommon_data), GFP_KERNEL);
+	if (gdata == NULL) {
 		dev_err(&hdev->dev, "can't allocate space for Logitech G19 device attributes\n");
 		error = -ENOMEM;
 		goto err_no_cleanup;
 	}
 
-	spin_lock_init(&data->lock);
+	g19data = kzalloc(sizeof(struct g19_data), GFP_KERNEL);
+	if (g19data == NULL) {
+		dev_err(&hdev->dev, "can't allocate space for Logitech G19 device attributes\n");
+		error = -ENOMEM;
+		goto err_cleanup_gdata;
+	}
+        gdata->data = g19data;
 
-	init_completion(&data->ready);
+	spin_lock_init(&gdata->lock);
 
-	data->hdev = hdev;
+	init_completion(&g19data->ready);
 
-	data->ep1_urb = usb_alloc_urb(0, GFP_KERNEL);
-	if (data->ep1_urb == NULL) {
+	gdata->hdev = hdev;
+
+	g19data->ep1_urb = usb_alloc_urb(0, GFP_KERNEL);
+	if (g19data->ep1_urb == NULL) {
 		dev_err(&hdev->dev, G19_NAME ": ERROR: can't alloc ep1 urb stuff\n");
 		error = -ENOMEM;
-		goto err_cleanup_data;
+		goto err_cleanup_g19data;
 	}
 
-	hid_set_drvdata(hdev, data);
+	hid_set_drvdata(hdev, gdata);
 
 	dbg_hid("Preparing to parse " G19_NAME " hid reports\n");
 
@@ -1132,49 +842,47 @@ static int g19_probe(struct hid_device *hdev,
 	}
 
 	/* Set up the input device for the key I/O */
-	data->input_dev = input_allocate_device();
-	if (data->input_dev == NULL) {
+	gdata->input_dev = input_allocate_device();
+	if (gdata->input_dev == NULL) {
 		dev_err(&hdev->dev, G19_NAME " error initializing the input device");
 		error = -ENOMEM;
 		goto err_cleanup_ep1_urb;
 	}
 
-	input_set_drvdata(data->input_dev, hdev);
+        input_set_drvdata(gdata->input_dev, gdata);
 
-	data->input_dev->name = G19_NAME;
-	data->input_dev->phys = hdev->phys;
-	data->input_dev->uniq = hdev->uniq;
-	data->input_dev->id.bustype = hdev->bus;
-	data->input_dev->id.vendor = hdev->vendor;
-	data->input_dev->id.product = hdev->product;
-	data->input_dev->id.version = hdev->version;
-	data->input_dev->dev.parent = hdev->dev.parent;
-	data->input_dev->keycode = data->keycode;
-	data->input_dev->keycodemax = G19_KEYMAP_SIZE;
-	data->input_dev->keycodesize = sizeof(int);
-	
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,37)
-	
-	data->input_dev->setkeycode = g19_input_setkeycode_new;
-	data->input_dev->getkeycode = g19_input_getkeycode_new;
+	gdata->input_dev->name = G19_NAME;
+	gdata->input_dev->phys = hdev->phys;
+	gdata->input_dev->uniq = hdev->uniq;
+	gdata->input_dev->id.bustype = hdev->bus;
+	gdata->input_dev->id.vendor = hdev->vendor;
+	gdata->input_dev->id.product = hdev->product;
+	gdata->input_dev->id.version = hdev->version;
+	gdata->input_dev->dev.parent = hdev->dev.parent;
+	gdata->input_dev->keycode = gdata->input_data.keycode;
+	gdata->input_dev->keycodemax = G19_KEYMAP_SIZE;
+	gdata->input_dev->keycodesize = sizeof(unsigned int);
+	gdata->input_dev->setkeycode = ginput_setkeycode;
+	gdata->input_dev->getkeycode = ginput_getkeycode;
 
-#else
+	input_set_capability(gdata->input_dev, EV_KEY, KEY_UNKNOWN);
+	gdata->input_dev->evbit[0] |= BIT_MASK(EV_REP);
 
-	data->input_dev->setkeycode = g19_input_setkeycode;
-	data->input_dev->getkeycode = g19_input_getkeycode;
+        gdata->input_data.notify_keymap_switched = g19_notify_keymap_switched;
 
-#endif
+        error = ginput_alloc(gdata, G19_KEYS);
+        if (error) {
+		dev_err(&hdev->dev, G19_NAME " error allocating memory for the input device");
+                goto err_cleanup_input_dev;
+        }
 
-	input_set_capability(data->input_dev, EV_KEY, KEY_UNKNOWN);
-	data->input_dev->evbit[0] |= BIT_MASK(EV_REP);
+	g19_initialize_keymap(gdata);
 
-	g19_initialize_keymap(data);
-
-	error = input_register_device(data->input_dev);
+	error = input_register_device(gdata->input_dev);
 	if (error) {
 		dev_err(&hdev->dev, G19_NAME " error registering the input device");
 		error = -EINVAL;
-		goto err_cleanup_input_dev;
+		goto err_cleanup_input_dev_data;
 	}
 
 	if (list_empty(feature_report_list)) {
@@ -1187,16 +895,16 @@ static int g19_probe(struct hid_device *hdev,
 	list_for_each_entry(report, feature_report_list, list) {
 		switch (report->id) {
 		case 0x04:
-			data->feature_report_4 = report;
+			g19data->feature_report_4 = report;
 			break;
 		case 0x05:
-			data->led_report = report;
+			g19data->led_report = report;
 			break;
 		case 0x06:
-			data->start_input_report = report;
+			g19data->start_input_report = report;
 			break;
 		case 0x07:
-			data->backlight_report = report;
+			g19data->backlight_report = report;
 			break;
 		default:
 			break;
@@ -1209,15 +917,15 @@ static int g19_probe(struct hid_device *hdev,
 	dbg_hid("Found all reports\n");
 
 	/* Create the LED structures */
-	for (i = 0; i < 7; i++) {
-		data->led_cdev[i] = kzalloc(sizeof(struct led_classdev), GFP_KERNEL);
-		if (data->led_cdev[i] == NULL) {
+	for (i = 0; i < LED_COUNT; i++) {
+		g19data->led_cdev[i] = kzalloc(sizeof(struct led_classdev), GFP_KERNEL);
+		if (g19data->led_cdev[i] == NULL) {
 			dev_err(&hdev->dev, G19_NAME " error allocating memory for led %d", i);
 			error = -ENOMEM;
 			goto err_cleanup_led_structs;
 		}
 		/* Set the accessor functions by copying from template*/
-		*(data->led_cdev[i]) = g19_led_cdevs[i];
+		*(g19data->led_cdev[i]) = g19_led_cdevs[i];
 
 		/*
 		 * Allocate memory for the LED name
@@ -1232,31 +940,34 @@ static int g19_probe(struct hid_device *hdev,
 			goto err_cleanup_led_structs;
 		}
 		switch (i) {
-		case 0:
-		case 1:
-		case 2:
+		case G19_LED_M1:
+		case G19_LED_M2:
+		case G19_LED_M3:
 			sprintf(led_name, "g19_%d:orange:m%d", hdev->minor, i+1);
 			break;
-		case 3:
+		case G19_LED_MR:
 			sprintf(led_name, "g19_%d:red:mr", hdev->minor);
 			break;
-		case 4:
+		case G19_LED_BL_R:
 			sprintf(led_name, "g19_%d:red:bl", hdev->minor);
 			break;
-		case 5:
+		case G19_LED_BL_G:
 			sprintf(led_name, "g19_%d:green:bl", hdev->minor);
 			break;
-		case 6:
+		case G19_LED_BL_B:
 			sprintf(led_name, "g19_%d:blue:bl", hdev->minor);
+			break;
+		case G19_LED_BL_SCREEN:
+			sprintf(led_name, "g19_%d:white:screen", hdev->minor);
 			break;
 
 		}
-		data->led_cdev[i]->name = led_name;
+		g19data->led_cdev[i]->name = led_name;
 	}
 
-	for (i = 0; i < 7; i++) {
+	for (i = 0; i < LED_COUNT; i++) {
 		led_num = i;
-		error = led_classdev_register(&hdev->dev, data->led_cdev[i]);
+		error = led_classdev_register(&hdev->dev, g19data->led_cdev[i]);
 		if (error < 0) {
 			dev_err(&hdev->dev, G19_NAME " error registering led %d", i);
 			error = -EINVAL;
@@ -1264,8 +975,8 @@ static int g19_probe(struct hid_device *hdev,
 		}
 	}
 
-	data->gfb_data = gfb_probe(hdev, GFB_PANEL_TYPE_320_240_16);
-	if (data->gfb_data == NULL) {
+	gdata->gfb_data = gfb_probe(hdev, GFB_PANEL_TYPE_320_240_16);
+	if (gdata->gfb_data == NULL) {
 		dev_err(&hdev->dev, G19_NAME " error registering framebuffer\n");
 		goto err_cleanup_registered_leds;
 	}
@@ -1282,71 +993,74 @@ static int g19_probe(struct hid_device *hdev,
 	/*
 	 * Wait here for stage 1 (substages 1-3) to complete
 	 */
-	wait_for_completion_timeout(&data->ready, HZ);
+	wait_for_completion_timeout(&g19data->ready, HZ);
 
 	/* Protect data->ready_stages before checking whether we're ready to proceed */
-	spin_lock_irqsave(&data->lock, irq_flags);
-	if (data->ready_stages != G19_READY_STAGE_1) {
+	spin_lock_irqsave(&gdata->lock, irq_flags);
+	if (g19data->ready_stages != G19_READY_STAGE_1) {
 		dev_warn(&hdev->dev, G19_NAME " hasn't completed stage 1 yet, forging ahead with initialization\n");
 		/* Force the stage */
-		data->ready_stages = G19_READY_STAGE_1;
+		g19data->ready_stages = G19_READY_STAGE_1;
 	}
-	init_completion(&data->ready);
-	data->ready_stages |= G19_READY_SUBSTAGE_4;
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	init_completion(&g19data->ready);
+	g19data->ready_stages |= G19_READY_SUBSTAGE_4;
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 
 	/*
 	 * Send the init report, then follow with the input report to trigger
 	 * report 6 and wait for us to get a response.
 	 */
 	g19_feature_report_4_send(hdev, G19_REPORT_4_INIT);
-	usbhid_submit_report(hdev, data->start_input_report, USB_DIR_IN);
-	wait_for_completion_timeout(&data->ready, HZ);
+	usbhid_submit_report(hdev, g19data->start_input_report, USB_DIR_IN);
+	wait_for_completion_timeout(&g19data->ready, HZ);
 
-	/* Protect data->ready_stages before checking whether we're ready to proceed */
-	spin_lock_irqsave(&data->lock, irq_flags);
-	if (data->ready_stages != G19_READY_STAGE_2) {
+	/* Protect g19data->ready_stages before checking whether we're ready to proceed */
+	spin_lock_irqsave(&gdata->lock, irq_flags);
+	if (g19data->ready_stages != G19_READY_STAGE_2) {
 		dev_warn(&hdev->dev, G19_NAME " hasn't completed stage 2 yet, forging ahead with initialization\n");
 		/* Force the stage */
-		data->ready_stages = G19_READY_STAGE_2;
+		g19data->ready_stages = G19_READY_STAGE_2;
 	}
-	init_completion(&data->ready);
-	data->ready_stages |= G19_READY_SUBSTAGE_6;
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	init_completion(&g19data->ready);
+	g19data->ready_stages |= G19_READY_SUBSTAGE_6;
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 
 	/*
 	 * Clear the LEDs
 	 */
 	g19_led_send(hdev);
 
-	data->rgb[0] = G19_DEFAULT_RED;
-	data->rgb[1] = G19_DEFAULT_GREEN;
-	data->rgb[2] = G19_DEFAULT_BLUE;
+	g19data->rgb[0] = G19_DEFAULT_RED;
+	g19data->rgb[1] = G19_DEFAULT_GREEN;
+	g19data->rgb[2] = G19_DEFAULT_BLUE;
 	g19_rgb_send(hdev);
+
+	g19data->screen_bl = G19_DEFAULT_BRIGHTNESS;
+	g19_screen_bl_send(hdev);
 
 	/*
 	 * Send the finalize report, then follow with the input report to trigger
 	 * report 6 and wait for us to get a response.
 	 */
 	g19_feature_report_4_send(hdev, G19_REPORT_4_FINALIZE);
-	usbhid_submit_report(hdev, data->start_input_report, USB_DIR_IN);
-	usbhid_submit_report(hdev, data->start_input_report, USB_DIR_IN);
-	wait_for_completion_timeout(&data->ready, HZ);
+	usbhid_submit_report(hdev, g19data->start_input_report, USB_DIR_IN);
+	usbhid_submit_report(hdev, g19data->start_input_report, USB_DIR_IN);
+	wait_for_completion_timeout(&g19data->ready, HZ);
 
 	/* Protect data->ready_stages before checking whether we're ready to proceed */
-	spin_lock_irqsave(&data->lock, irq_flags);
+	spin_lock_irqsave(&gdata->lock, irq_flags);
 
-	if (data->ready_stages != G19_READY_STAGE_3) {
+	if (g19data->ready_stages != G19_READY_STAGE_3) {
 		dev_warn(&hdev->dev, G19_NAME " hasn't completed stage 3 yet, forging ahead with initialization\n");
 		/* Force the stage */
-		data->ready_stages = G19_READY_STAGE_3;
+		g19data->ready_stages = G19_READY_STAGE_3;
 	} else {
 		dbg_hid(G19_NAME " stage 3 complete\n");
 	}
 
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 
-	g19_set_keymap_switching(hdev, 1);
+	ginput_set_keymap_switching(gdata, 1);
 
 	g19_ep1_read(hdev);
 
@@ -1357,31 +1071,34 @@ static int g19_probe(struct hid_device *hdev,
 
 err_cleanup_registered_leds:
 	for (i = 0; i < led_num; i++)
-		led_classdev_unregister(data->led_cdev[i]);
+		led_classdev_unregister(g19data->led_cdev[i]);
 
 err_cleanup_led_structs:
-	for (i = 0; i < 7; i++) {
-		if (data->led_cdev[i] != NULL) {
-			if (data->led_cdev[i]->name != NULL)
-				kfree(data->led_cdev[i]->name);
-			kfree(data->led_cdev[i]);
+	for (i = 0; i < LED_COUNT; i++) {
+		if (g19data->led_cdev[i] != NULL) {
+			if (g19data->led_cdev[i]->name != NULL)
+				kfree(g19data->led_cdev[i]->name);
+			kfree(g19data->led_cdev[i]);
 		}
 	}
 
 err_cleanup_input_dev_reg:
-	input_unregister_device(data->input_dev);
+	input_unregister_device(gdata->input_dev);
+
+err_cleanup_input_dev_data:
+        ginput_free(gdata);
 
 err_cleanup_input_dev:
-	input_free_device(data->input_dev);
+	input_free_device(gdata->input_dev);
 
 err_cleanup_ep1_urb:
-	usb_free_urb(data->ep1_urb);
+	usb_free_urb(g19data->ep1_urb);
 
+err_cleanup_g19data:
+        kfree(g19data);
 
-
-err_cleanup_data:
-	/* Make sure we clean up the allocated data structure */
-	kfree(data);
+err_cleanup_gdata:
+	kfree(gdata);
 
 err_no_cleanup:
 
@@ -1392,46 +1109,51 @@ err_no_cleanup:
 
 static void g19_remove(struct hid_device *hdev)
 {
-	struct g19_data *data;
+	struct gcommon_data *gdata;
+	struct g19_data *g19data;
 	int i;
 
 	hdev->ll_driver->close(hdev);
 
-	hid_hw_stop(hdev);
-
 	sysfs_remove_group(&(hdev->dev.kobj), &g19_attr_group);
 
 	/* Get the internal g19 data buffer */
-	data = hid_get_drvdata(hdev);
+	gdata = hid_get_drvdata(hdev);
+        g19data = gdata->data;
 
-	input_unregister_device(data->input_dev);
+	input_unregister_device(gdata->input_dev);
+        ginput_free(gdata);
 
-	kfree(data->name);
+	kfree(gdata->name);
 
 	/* Clean up the leds */
-	for (i = 0; i < 7; i++) {
-		led_classdev_unregister(data->led_cdev[i]);
-		kfree(data->led_cdev[i]->name);
-		kfree(data->led_cdev[i]);
+	for (i = 0; i < LED_COUNT; i++) {
+		led_classdev_unregister(g19data->led_cdev[i]);
+		kfree(g19data->led_cdev[i]->name);
+		kfree(g19data->led_cdev[i]);
 	}
 
-	gfb_remove(data->gfb_data);
+	gfb_remove(gdata->gfb_data);
 
-	usb_free_urb(data->ep1_urb);
+	sysfs_remove_group(&(hdev->dev.kobj), &g19_attr_group);
 
+	usb_free_urb(g19data->ep1_urb);
 
 	/* Finally, clean up the g19 data itself */
-	kfree(data);
+        kfree(g19data);
+	kfree(gdata);
+	hid_hw_stop(hdev);
 }
 
 static void __UNUSED g19_post_reset_start(struct hid_device *hdev)
 {
         unsigned long irq_flags;
-	struct g19_data *data = hid_get_g19data(hdev);
+	struct gcommon_data *gdata = hid_get_gdata(hdev);
+	struct g19_data *g19data = gdata->data;
 
-	spin_lock_irqsave(&data->lock, irq_flags);
-	data->need_reset = 1;
-	spin_unlock_irqrestore(&data->lock, irq_flags);
+	spin_lock_irqsave(&gdata->lock, irq_flags);
+	g19data->need_reset = 1;
+	spin_unlock_irqrestore(&gdata->lock, irq_flags);
 }
 
 static const struct hid_device_id g19_devices[] = {
@@ -1463,4 +1185,5 @@ module_init(g19_init);
 module_exit(g19_exit);
 MODULE_DESCRIPTION("Logitech G19 HID Driver");
 MODULE_AUTHOR("Alistair Buxton (a.j.buxton@gmail.com)");
-MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Thomas Berger (tbe@boreus.de)");
+MODULE_LICENSE("GPL v2");
